@@ -29,7 +29,13 @@ class DataLakeSinkService(BaseModuleService):
 
     def __init__(self) -> None:
         super().__init__()
-        self._lake_base = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data_store", "lake")
+        # 数据湖与 JSON 存储共用同一个根目录，便于按环境隔离落湖数据。
+        store_base = getattr(json_store, "_base_dir", None)
+        if store_base is not None:
+            self._lake_base = os.path.join(str(store_base), "lake")
+        else:
+            self._lake_base = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data_store", "lake")
         os.makedirs(self._lake_base, exist_ok=True)
         self._write_stats: dict[str, int] = {}
 

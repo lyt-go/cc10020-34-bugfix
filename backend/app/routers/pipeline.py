@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -24,6 +23,8 @@ class WebhookPayload(BaseModel):
 class BatchExecuteRequest(BaseModel):
     task_id: int
     max_pages: int = 5
+    transform_rule_id: int | None = None
+    batch_id: str | None = None
 
 
 class DlqReplayRequest(BaseModel):
@@ -41,11 +42,28 @@ class EndpointTestRequest(BaseModel):
 class TransformRequest(BaseModel):
     rule_id: int
     source_data: list[dict[str, Any]]
+    batch_id: str | None = None
+    record_type: str | None = None
+    retry: bool = False
+
+
+class TransformRetryRequest(BaseModel):
+    rule_id: int
+    source_data: dict[str, Any]
+    original_decision_id: int | str | None = None
+    batch_id: str | None = None
+    record_type: str | None = None
+
+
+class BatchReworkRequest(BaseModel):
+    batch_id: str
+    rule_id: int | None = None
 
 
 class ValidationRequest(BaseModel):
     records: list[dict[str, Any]]
     source_module: str = ""
+    record_types: list[str] | None = None
 
 
 @router.post("/webhook-to-lake")
@@ -70,10 +88,16 @@ def pipeline_batch_ingest_to_lake(request: BatchExecuteRequest) -> dict[str, Any
     """链路2: 批量拉取 → 数据转换 → 质量校验 → 数据落湖。
 
     完整覆盖：batch_ingest → data_transform → data_quality_rule → data_lake_sink。
+    只有转换放行决策为“已放行”的记录才会落湖，成功数按决策核算。
     """
     from app.services.batch_ingest import BatchIngestService
     svc = BatchIngestService()
-    result = svc.execute_batch(task_id=request.task_id, max_pages=request.max_pages)
+    result = svc.execute_batch(
+        task_id=request.task_id,
+        max_pages=request.max_pages,
+        transform_rule_id=request.transform_rule_id,
+        batch_id=request.batch_id,
+    )
     return result
 
 
@@ -125,14 +149,65 @@ def pipeline_endpoint_test(request: EndpointTestRequest) -> dict[str, Any]:
 
 @router.post("/transform-validate")
 def pipeline_transform_validate(request: TransformRequest) -> dict[str, Any]:
-    """链路6: 数据转换 → 质量校验 → 结果追踪。
+    """链路6: 数据转换 → 质量校验 → 转换放行决策 → 结果追踪。
 
     完整覆盖：data_transform → data_quality_rule → data_lake_sink。
+    含阻断字段的转换数据不会出现在成功结果里，而是留在决策台账中。
     """
     from app.services.data_transform import DataTransformService
     transform_svc = DataTransformService()
-    batch_result = transform_svc.batch_transform(rule_id=request.rule_id, source_records=request.source_data)
+    batch_result = transform_svc.batch_transform(
+        rule_id=request.rule_id,
+        source_records=request.source_data,
+        batch_id=request.batch_id,
+        record_type=request.record_type,
+        retry=request.retry,
+    )
     return batch_result
+
+
+@router.post("/transform-retry")
+def pipeline_transform_retry(request: TransformRetryRequest) -> dict[str, Any]:
+    """链路6a: 转换补做（重试）→ 核对原字段结论与原输入 → 放行决策。"""
+    from app.services.data_transform import DataTransformService
+    return DataTransformService().retry_transform(
+        rule_id=request.rule_id,
+        source_data=request.source_data,
+        original_decision_id=request.original_decision_id,
+        batch_id=request.batch_id,
+        record_type=request.record_type,
+    )
+
+
+@router.get("/transform-batches/{batch_id}")
+def pipeline_transform_batch(batch_id: str) -> dict[str, Any]:
+    """链路6b: 按批次取已放行的转换结果，以及主记录/明细的阻断原因。"""
+    from app.services.data_transform import DataTransformService
+    return DataTransformService().get_batch_release(batch_id)
+
+
+@router.get("/transform-decisions/{decision_id}")
+def pipeline_transform_decision(decision_id: str) -> dict[str, Any]:
+    """链路6c: 回查单条转换放行决策及其补做记录。"""
+    from app.services.data_transform import DataTransformService
+    decision = DataTransformService().get_decision(decision_id)
+    if decision is None:
+        raise HTTPException(status_code=404, detail=f"转换放行决策 {decision_id} 不存在")
+    return decision
+
+
+@router.get("/transform-reconcile")
+def pipeline_transform_reconcile(batch_id: str | None = None) -> dict[str, Any]:
+    """链路6d: 质量报告失败数与批次成功明细对账，回查错误算入成功的源行。"""
+    from app.services.data_transform import DataTransformService
+    return DataTransformService().reconcile_batch(batch_id)
+
+
+@router.post("/batch-rework")
+def pipeline_batch_rework(request: BatchReworkRequest) -> dict[str, Any]:
+    """链路6e: 对批次里被阻断的记录补做，原批次校验结论和来源保持可追溯。"""
+    from app.services.batch_ingest import BatchIngestService
+    return BatchIngestService().rework_batch(request.batch_id, rule_id=request.rule_id)
 
 
 @router.post("/batch-validate")
@@ -143,7 +218,11 @@ def pipeline_validate_batch(request: ValidationRequest) -> dict[str, Any]:
     """
     from app.services.data_quality_rule import DataQualityRuleService
     svc = DataQualityRuleService()
-    result = svc.validate_batch(records=request.records, source_module=request.source_module)
+    result = svc.validate_batch(
+        records=request.records,
+        source_module=request.source_module,
+        record_types=request.record_types,
+    )
     return result
 
 
